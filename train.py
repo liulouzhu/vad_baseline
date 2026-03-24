@@ -155,5 +155,20 @@ if __name__ == '__main__':
     test_dataset = XDDataset(args.visual_length, args.test_list, args.audio_test, True, label_map)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = CLIPVAD(args.classes_num, args.embed_dim, args.visual_length, args.visual_width, args.visual_head, args.visual_layers, args.attn_window, args.prompt_prefix, args.prompt_postfix, device)
+    model = CLIPVAD(
+        num_class=args.classes_num,
+        embed_dim=args.embed_dim,
+        visual_length=args.visual_length,
+        visual_width=args.visual_width,
+        visual_head=args.visual_head,
+        visual_layers=args.visual_layers,
+        attn_window=args.attn_window,
+        prompt_prefix=args.prompt_prefix,
+        prompt_postfix=args.prompt_postfix,
+        device=device,
+        audio_hidden_dim=args.audio_hidden_dim,
+        coattn_n_head=args.coattn_n_head,
+        coattn_layers=args.coattn_layers,
+        use_coattn=args.use_coattn
+    )
     train(model, train_loader, test_loader, args, label_map, device)

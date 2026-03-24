@@ -89,7 +89,7 @@ if __name__ == '__main__':
 
     label_map = dict({'A': 'normal', 'B1': 'fighting', 'B2': 'shooting', 'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion'})
 
-    test_dataset = XDDataset(args.visual_length, args.test_list, True, label_map)
+    test_dataset = XDDataset(args.visual_length, args.test_list, args.audio_test, True, label_map)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     prompt_text = get_prompt_text(label_map)
@@ -97,7 +97,22 @@ if __name__ == '__main__':
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
-    model = CLIPVAD(args.classes_num, args.embed_dim, args.visual_length, args.visual_width, args.visual_head, args.visual_layers, args.attn_window, args.prompt_prefix, args.prompt_postfix, device)
+    model = CLIPVAD(
+        num_class=args.classes_num,
+        embed_dim=args.embed_dim,
+        visual_length=args.visual_length,
+        visual_width=args.visual_width,
+        visual_head=args.visual_head,
+        visual_layers=args.visual_layers,
+        attn_window=args.attn_window,
+        prompt_prefix=args.prompt_prefix,
+        prompt_postfix=args.prompt_postfix,
+        device=device,
+        audio_hidden_dim=args.audio_hidden_dim,
+        coattn_n_head=args.coattn_n_head,
+        coattn_layers=args.coattn_layers,
+        use_coattn=args.use_coattn
+    )
     model_param = torch.load(args.model_path)
     model.load_state_dict(model_param)
 
