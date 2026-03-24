@@ -62,139 +62,113 @@ class Transformer(nn.Module):
 # =============================================================================
 class CoAttentionFusion(nn.Module):
     """
-    Multi-Head Cross-Attention with learnable gating for audio-visual fusion.
+    Multi-Head Cross-Attention for audio-visual fusion.
 
-    Unlike simple addition (visual + audio), this module allows each modality
-    to dynamically attend to the other, learning which modality to trust at
-    each timestep.
+    Key design: output scale must match visual+audio addition (~2x single modality).
+    We use residual-like addition after cross-attention to preserve magnitude.
     """
 
     def __init__(self, d_model: int, n_head: int = 4):
         super().__init__()
-        assert d_model % n_head == 0, f"d_model {d_model} must be divisible by n_head {n_head}"
+        assert d_model % n_head == 0
         self.d_model = d_model
         self.n_head = n_head
         self.d_k = d_model // n_head
 
         # Visual attends to Audio
-        self.visual_to_audio_attn = nn.MultiheadAttention(
-            d_model, n_head, batch_first=True
-        )
-        self.visual_norm1 = LayerNorm(d_model)
+        self.v2a_attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.v2a_norm = LayerNorm(d_model)
+        self.v2a_ffn = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.v2a_ffn_norm = LayerNorm(d_model)
 
         # Audio attends to Visual
-        self.audio_to_visual_attn = nn.MultiheadAttention(
-            d_model, n_head, batch_first=True
-        )
-        self.audio_norm1 = LayerNorm(d_model)
-
-        # FFN after cross-attention
-        self.visual_ffn = nn.Sequential(OrderedDict([
+        self.a2v_attn = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.a2v_norm = LayerNorm(d_model)
+        self.a2v_ffn = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
             ("gelu", QuickGELU()),
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
-        self.audio_ffn = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
-        self.visual_norm2 = LayerNorm(d_model)
-        self.audio_norm2 = LayerNorm(d_model)
+        self.a2v_ffn_norm = LayerNorm(d_model)
 
-        # Learnable gating: controls how much each modality contributes to fusion
-        self.gate_v = nn.Parameter(torch.zeros(1))  # visual gate
-        self.gate_a = nn.Parameter(torch.zeros(1))  # audio gate
+        # Learnable fusion weights (initialized to 0.5 each, sum=1 after softmax)
+        self.logit_v = nn.Parameter(torch.tensor(0.0))
+        self.logit_a = nn.Parameter(torch.tensor(0.0))
 
-        # Output projection
-        self.fusion_proj = nn.Linear(d_model * 2, d_model)
+        # Output projection (to maintain same dim as input)
+        self.out_proj = nn.Linear(d_model * 2, d_model)
 
     def forward(self, visual: torch.Tensor, audio: torch.Tensor,
                 padding_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
-            visual: [B, T, D] visual features
-            audio:  [B, T, D] audio features
+            visual: [B, T, D] visual features (D = d_model)
+            audio:  [B, T, D] audio features  (D = d_model)
             padding_mask: [B, T] True for padded positions
         Returns:
-            fused: [B, T, D] fused features
+            fused: [B, T, D] fused features (same scale as visual + audio)
         """
         B, T, D = visual.shape
+        key_mask = padding_mask
 
-        # ---- Cross-Attention: Visual attends to Audio ----
-        v2a, _ = self.visual_to_audio_attn(
-            query=visual,
-            key=audio,
-            value=audio,
-            key_padding_mask=padding_mask
+        # ---- Visual attends to Audio ----
+        v2a, _ = self.v2a_attn(
+            query=visual, key=audio, value=audio,
+            key_padding_mask=key_mask
         )
-        visual = visual + v2a
-        visual = self.visual_norm1(visual)
-        visual = visual + self.visual_ffn(visual)
-        visual = self.visual_norm2(visual)
+        visual = visual + self.v2a_ffn(self.v2a_ffn_norm(self.v2a_norm(visual + v2a)))
 
-        # ---- Cross-Attention: Audio attends to Visual ----
-        a2v, _ = self.audio_to_visual_attn(
-            query=audio,
-            key=visual,
-            value=visual,
-            key_padding_mask=padding_mask
+        # ---- Audio attends to Visual ----
+        a2v, _ = self.a2v_attn(
+            query=audio, key=visual, value=visual,
+            key_padding_mask=key_mask
         )
-        audio = audio + a2v
-        audio = self.audio_norm1(audio)
-        audio = audio + self.audio_ffn(audio)
-        audio = self.audio_norm2(audio)
+        audio = audio + self.a2v_ffn(self.a2v_ffn_norm(self.a2v_norm(audio + a2v)))
 
-        # ---- Gated Fusion ----
-        # sigmoid gates ensure 0-1 range, initialized to 0.5 (equal weight)
-        g_v = torch.sigmoid(self.gate_v + torch.log(torch.tensor(2.0)))
-        g_a = torch.sigmoid(self.gate_a + torch.log(torch.tensor(2.0)))
-        # Normalize so they sum to 1
-        g_sum = g_v + g_a + 1e-8
-        g_v = g_v / g_sum
-        g_a = g_a / g_sum
-
-        fused = g_v * visual + g_a * audio
+        # ---- Learnable Weighted Sum (preserve original additive scale) ----
+        # Unlike gating (which halves magnitude), we use additive weighting
+        # that can also amplify if needed (original = 1*v + 1*a, our default ≈ 0.5*v + 0.5*a)
+        w_v = torch.sigmoid(self.logit_v)
+        w_a = torch.sigmoid(self.logit_a)
+        # Normalize to preserve original additive scale
+        w_sum = w_v + w_a + 1e-8
+        w_v = w_v / w_sum * 2  # multiply by 2 so (w_v+w_a) ≈ 2 when initialized at 0.5
+        w_a = w_a / w_sum * 2
+        fused = w_v * visual + w_a * audio
 
         return fused
 
 
 # =============================================================================
-# Audio Temporal Encoder (replaces LSTM)
+# Audio Temporal Transformer Encoder (replaces LSTM when use_coattn=True)
 # =============================================================================
 class AudioTemporalEncoder(nn.Module):
-    """
-    Temporal Transformer encoder for audio features.
-    Replaces the original LSTM with a position-aware Transformer,
-    which better captures long-range temporal dependencies in audio.
-    """
+    """Transformer-based audio temporal encoder with position embeddings."""
 
     def __init__(self, d_model: int, n_layers: int, n_head: int,
                  attn_mask: torch.Tensor = None):
         super().__init__()
-        self.encoder = Transformer(
-            width=d_model,
-            layers=n_layers,
-            heads=n_head,
-            attn_mask=attn_mask
-        )
+        self.layers = nn.ModuleList([
+            ResidualAttentionBlock(d_model, n_head, attn_mask)
+            for _ in range(n_layers)
+        ])
+        self.norm = LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Args:
-            x: [B, T, D_audio] audio features (D_audio may differ from D_visual)
-        Returns:
-            [B, T, D_model] encoded audio
-        """
-        # x: [B, T, D] -> [T, B, D] for Transformer
-        x = x.permute(1, 0, 2)
-        x, _ = self.encoder((x, padding_mask))
-        x = x.permute(1, 0, 2)  # [B, T, D]
-        return x
+    def forward(self, x: torch.Tensor, padding_mask=None):
+        # x: [B, T, D]
+        x = x.permute(1, 0, 2)  # -> [T, B, D]
+        for layer in self.layers:
+            x, _ = layer((x, padding_mask))
+        x = x.permute(1, 0, 2)  # -> [B, T, D]
+        return self.norm(x)
 
 
 # =============================================================================
-# Main Model: CLIPVAD with Co-Attention Fusion
+# Main Model
 # =============================================================================
 class CLIPVAD(nn.Module):
     def __init__(self,
@@ -208,7 +182,7 @@ class CLIPVAD(nn.Module):
                  prompt_prefix: int,
                  prompt_postfix: int,
                  device,
-                 # New args for Co-Attention fusion
+                 # Co-Attention args
                  audio_hidden_dim: int = 512,
                  coattn_n_head: int = 4,
                  coattn_layers: int = 1,
@@ -225,7 +199,7 @@ class CLIPVAD(nn.Module):
         self.device = device
         self.use_coattn = use_coattn
 
-        # ---- Visual Temporal Encoder (unchanged) ----
+        # ---- Visual Temporal Encoder ----
         self.temporal = Transformer(
             width=visual_width,
             layers=visual_layers,
@@ -233,7 +207,7 @@ class CLIPVAD(nn.Module):
             attn_mask=self.build_attention_mask(self.attn_window)
         )
 
-        # ---- GCN for Visual (unchanged) ----
+        # ---- GCN layers ----
         width = int(visual_width / 2)
         self.gc1 = GraphConvolution(visual_width, width, residual=True)
         self.gc2 = GraphConvolution(width, width, residual=True)
@@ -243,25 +217,35 @@ class CLIPVAD(nn.Module):
         self.linear = nn.Linear(visual_width, visual_width)
         self.gelu = QuickGELU()
 
-        # ---- Audio Temporal Encoder (replaces LSTM) ----
-        # Project audio features to visual_width dimension
+        # ---- Audio encoder ----
+        # Project audio features (e.g. 512D from wav2clip) to visual_width
         self.audio_proj = nn.Linear(audio_hidden_dim, visual_width)
-        self.audio_temporal = AudioTemporalEncoder(
-            d_model=visual_width,
-            n_layers=coattn_layers,
-            n_head=visual_head,
-            attn_mask=self.build_attention_mask(self.attn_window)
-        )
-        self.audio_norm = LayerNorm(visual_width)
 
-        # ---- Co-Attention Fusion Module (Idea 1) ----
         if self.use_coattn:
+            # NEW: Transformer-based audio encoder
+            self.audio_temporal = AudioTemporalEncoder(
+                d_model=visual_width,
+                n_layers=coattn_layers,
+                n_head=visual_head,
+                attn_mask=self.build_attention_mask(self.attn_window)
+            )
+            # Co-Attention fusion module
             self.coattn_fusion = CoAttentionFusion(
                 d_model=visual_width,
                 n_head=coattn_n_head
             )
+        else:
+            # ORIGINAL: LSTM audio encoder (EXACTLY as in original VadCLIP)
+            self.lstm = nn.LSTM(
+                input_size=audio_hidden_dim,
+                hidden_size=256,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+            # NOTE: no LayerNorm after LSTM in original!
 
-        # ---- Classification Heads (unchanged structure) ----
+        # ---- Classification heads ----
         self.mlp1 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
@@ -274,7 +258,7 @@ class CLIPVAD(nn.Module):
         ]))
         self.classifier = nn.Linear(visual_width, 1)
 
-        # ---- CLIP Model (frozen) ----
+        # ---- CLIP (frozen) ----
         self.clipmodel, _ = clip.load("ViT-B/16", device)
         for clip_param in self.clipmodel.parameters():
             clip_param.requires_grad = False
@@ -283,16 +267,6 @@ class CLIPVAD(nn.Module):
         self.text_prompt_embeddings = nn.Embedding(77, self.embed_dim)
 
         self.initialize_parameters()
-
-        # ---- Original LSTM (kept for ablation comparison) ----
-        self.lstm = nn.LSTM(
-            input_size=512,
-            hidden_size=256,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-        self.lstm_norm = nn.LayerNorm(visual_width)
 
     def initialize_parameters(self):
         nn.init.normal_(self.text_prompt_embeddings.weight, std=0.01)
@@ -359,26 +333,6 @@ class CLIPVAD(nn.Module):
 
         return x
 
-    def encode_audio(self, audio: torch.Tensor, padding_mask=None) -> torch.Tensor:
-        """
-        Encode audio features using AudioTemporalEncoder (Transformer).
-        Replaces the original LSTM encoder.
-        """
-        # Project audio to visual_width dimension
-        audio = self.audio_proj(audio)  # [B, T, 512] -> [B, T, visual_width]
-        # Temporal encoding with Transformer
-        audio = self.audio_temporal(audio, padding_mask)  # [B, T, visual_width]
-        audio = self.audio_norm(audio)
-        return audio
-
-    def encode_audio_lstm(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Original LSTM-based audio encoder (for ablation comparison).
-        """
-        audio_feat, _ = self.lstm(audio)  # [B, T, 512]
-        audio_feat = self.lstm_norm(audio_feat)
-        return audio_feat
-
     def encode_textprompt(self, text):
         word_tokens = clip.tokenize(text).to(self.device)
         word_embedding = self.clipmodel.encode_token(word_tokens)
@@ -402,40 +356,30 @@ class CLIPVAD(nn.Module):
 
     def forward(self, visual, padding_mask, text, lengths):
         """
-        Forward pass with Co-Attention Fusion.
-
-        Compared to original CLIPVAD:
-        - Audio encoder: LSTM -> AudioTemporalEncoder (Transformer)
-        - Fusion:       addition -> Co-Attention with learnable gating
+        Forward pass. When use_coattn=False, this is EXACTLY the same as original VadCLIP.
+        When use_coattn=True, audio uses Transformer encoder and Co-Attention fusion.
         """
-        visual_only = visual[:, :, :512]      # [B, T, 512]
-        audio_only = visual[:, :, 512:]       # [B, T, 512]
+        visual_only = visual[:, :, :512]      # [B, T, 512] CLIP visual
+        audio_only = visual[:, :, 512:]       # [B, T, 512] wav2clip audio
 
-        # ---- Visual branch (unchanged) ----
+        # ---- Visual encoding (identical to original) ----
         visual_features = self.encode_video(visual_only, padding_mask, lengths)
 
-        # ---- Audio branch: choose encoder ----
+        # ---- Audio encoding ----
         if self.use_coattn:
-            # New: Transformer-based audio encoder
-            audio_features = self.encode_audio(audio_only, padding_mask)
+            # NEW: Transformer-based encoder + Co-Attention fusion
+            audio_proj = self.audio_proj(audio_only)  # [B, T, 512] -> [B, T, 512]
+            audio_features = self.audio_temporal(audio_proj, padding_mask)  # [B, T, 512]
+            fused_features = self.coattn_fusion(visual_features, audio_features, padding_mask)
         else:
-            # Original: LSTM audio encoder
-            audio_features = self.encode_audio_lstm(audio_only)
+            # ORIGINAL: LSTM encoder, direct addition (identical to original VadCLIP)
+            audio_features, _ = self.lstm(audio_only)  # [B, T, 512], bidirectional LSTM
+            fused_features = visual_features + audio_features  # [B, T, 512]
 
-        # ---- Co-Attention Fusion (replaces simple addition) ----
-        if self.use_coattn:
-            fused_features = self.coattn_fusion(
-                visual_features, audio_features, padding_mask
-            )
-        else:
-            # Fallback: simple addition (same as original)
-            fused_features = visual_features + audio_features
-
-        # ---- Text & Classification (unchanged) ----
+        # ---- Text prompt & Classification (identical to original) ----
         text_features_ori = self.encode_textprompt(text)
-        logits1 = self.classifier(
-            fused_features + self.mlp2(fused_features)
-        )
+
+        logits1 = self.classifier(fused_features + self.mlp2(fused_features))
 
         text_features = text_features_ori
         logits_attn = logits1.permute(0, 2, 1)
